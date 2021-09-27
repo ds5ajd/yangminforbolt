@@ -7,6 +7,9 @@
 
 #define CAN CAN1
 
+#define PEDAL_USB
+#define DEBUG
+
 #ifdef PEDAL_USB
   #include "drivers/usb.h"
 #else
