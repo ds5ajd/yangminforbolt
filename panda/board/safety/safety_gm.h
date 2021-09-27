@@ -14,7 +14,7 @@ const int GM_DRIVER_TORQUE_FACTOR = 4;
 const int GM_MAX_GAS = 3072;
 const int GM_MAX_REGEN = 1404;
 const int GM_MAX_BRAKE = 350;
-const int GM_GAS_INTERCEPTOR_THRESHOLD = 458;  // (610 + 306.25) / 2ratio between offset and gain from dbc file
+const int GM_GAS_INTERCEPTOR_THRESHOLD = 484;  // (630 + 338) / 2ratio between offset and gain from dbc file
 #define GM_GET_INTERCEPTOR(msg) (((GET_BYTE((msg), 0) << 8) + GET_BYTE((msg), 1) + ((GET_BYTE((msg), 2) << 8) + GET_BYTE((msg), 3)) / 2 ) / 2) // avg between 2 tracks
 
 // Safety-relevant CAN messages for Bolt EV
@@ -30,21 +30,21 @@ const int GM_GAS_INTERCEPTOR_THRESHOLD = 458;  // (610 + 306.25) / 2ratio betwee
 #define MSG_TX_ASCM       0x40A   // TX by OP, for ASCM, To do : We need to check if this message is used for Bolt EV or not.
 #define MSG_TX_ACC        0x370   // TX by OP, for ACC Status, To do : We need to check if this message is used for Bolt EV or not.
 #define MSG_TX_PEDAL      0x200   // TX by OP, for Pedal Interceptor
+#define MSG_REGEN         0x189   // TX/RX for Regen Paddle
 
 
-const CanMsg GM_TX_MSGS[] = {{MSG_TX_LKA, 0, 4}, {MSG_TX_ALIVE, 0, 7}, {MSG_TX_ASCM, 0, 7}, {MSG_TX_ACC, 0, 6}, {MSG_TX_PEDAL, 0, 6}, // pt bus
+const CanMsg GM_TX_MSGS[] = {{MSG_TX_LKA, 0, 4}, {MSG_TX_ALIVE, 0, 7}, {MSG_TX_ASCM, 0, 7}, {MSG_TX_ACC, 0, 6}, {MSG_TX_PEDAL, 0, 6}, {MSG_REGEN, 0, 7}, // pt bus
                              {0x104c006c, 3, 3}, {0x10400060, 3, 5}};  // gmlan
 
 // TODO: do checksum and counter checks. Add correct timestep, 0.1s for now.
-AddrCheckStruct gm_addr_checks[] = {
+AddrCheckStruct gm_rx_checks[] = {
   {.msg = {{MSG_RX_STEER, 0, 8, .expected_timestep = 100000U}, { 0 }, { 0 }}},
   {.msg = {{MSG_RX_WHEEL, 0, 5, .expected_timestep = 100000U}, { 0 }, { 0 }}},
   {.msg = {{MSG_RX_BUTTON, 0, 7, .expected_timestep = 100000U}, { 0 }, { 0 }}},
   {.msg = {{MSG_RX_BRAKE, 0, 6, .expected_timestep = 100000U}, { 0 }, { 0 }}},
   {.msg = {{MSG_RX_GAS, 0, 7, .expected_timestep = 100000U}, { 0 }, { 0 }}},
 };
-#define GM_RX_CHECK_LEN (sizeof(gm_addr_checks) / sizeof(gm_addr_checks[0]))
-addr_checks gm_rx_checks = {gm_addr_checks, GM_RX_CHECK_LEN};
+const int GM_RX_CHECK_LEN = sizeof(gm_rx_checks) / sizeof(gm_rx_checks[0]);
 
 int cam_can_bus = -1;
 int bus_camera = -1;
@@ -52,7 +52,8 @@ int bus_vehicle = -1;
 
 static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
-  bool valid = addr_safety_check(to_push, &gm_rx_checks, NULL, NULL, NULL);
+  bool valid = addr_safety_check(to_push, gm_rx_checks, GM_RX_CHECK_LEN,
+                                 NULL, NULL, NULL);
 
   int addr = GET_ADDR(to_push);
   int bus = GET_BUS(to_push);
@@ -117,15 +118,14 @@ static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     // Check if LKA camera are online
     // on powertrain bus.
     // 384 = ASCMLKASteeringCmd
-    generic_rx_checks(((addr == MSG_TX_LKA) || (addr == 715)));
+    generic_rx_checks(addr == MSG_TX_LKA);
   }
   return valid;
 }
 
 static bool gm_steering_check(int desired_torque) {
-  
-  uint32_t ts = MICROSECOND_TIMER->CNT;
-  bool violation = 0;
+  bool violation = false;
+  uint32_t ts = microsecond_timer_get();
 
   if (controls_allowed) {
     // *** global torque limit check ***
@@ -187,8 +187,6 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
   // LKA STEER: safety check
   if (addr == MSG_TX_LKA) {
     int desired_torque = ((GET_BYTE(to_send, 0) & 0x7U) << 8) + GET_BYTE(to_send, 1);
-    
-
     desired_torque = to_signed(desired_torque, 11);
 
     if (gm_steering_check(desired_torque)) {
@@ -198,6 +196,18 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
   // 1 allows the message through
   return tx;
+}
+
+static void gm_init(int16_t param) {
+  UNUSED(param);
+  controls_allowed = false;
+  relay_malfunction_reset();
+  gas_interceptor_detected = 0;
+  cam_can_bus = -1;
+  bus_camera = -1;
+  //bus_radar = 1;  // Radar can bus, Bolt EV doesn't need this can bus
+  bus_vehicle = 0; //vehicle PT can bus for comma ai harness
+  //bus_chassis = 3; //vehicle Chassis can bus, Bolt EV doesn't need this can bus
 }
 
 static int gm_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -225,26 +235,12 @@ static int gm_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   return bus_fwd;
 }
 
-
-static const addr_checks* gm_init(int16_t param) {
-  UNUSED(param);
-  controls_allowed = false;
-  relay_malfunction_reset();
-  gas_interceptor_detected = 0;
-  cam_can_bus = -1;
-  bus_camera = -1;
-  //bus_radar = 1;  // Radar can bus, Bolt EV doesn't need this can bus
-  bus_vehicle = 0; //vehicle PT can bus for comma ai harness
-  return &gm_rx_checks;
-}
-
-
 const safety_hooks gm_hooks = {
   .init = gm_init,
   .rx = gm_rx_hook,
   .tx = gm_tx_hook,
   .tx_lin = nooutput_tx_lin_hook,
   .fwd = gm_fwd_hook,
-//  .addr_check = gm_addr_checks,
-//  .addr_check_len = sizeof(gm_addr_checks) / sizeof(gm_addr_checks[0]),
+  .addr_check = gm_rx_checks,
+  .addr_check_len = sizeof(gm_rx_checks) / sizeof(gm_rx_checks[0]),
 };
